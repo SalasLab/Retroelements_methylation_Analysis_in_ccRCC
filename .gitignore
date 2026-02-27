@@ -1,0 +1,58 @@
+# =============================================================
+# R generated files
+# =============================================================
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
+# R markdown / knitr cache and regeneratable output
+*_cache/
+*_files/
+*.html
+
+# =============================================================
+# Large data files — DO NOT commit to GitHub
+# (beta matrices, methylation arrays, raw data are too large
+#  and may be subject to data access agreements)
+# =============================================================
+*.rds
+*.RDS
+*.rda
+*.RData
+*.csv
+*.tsv
+*.txt
+*.xlsx
+*.bed
+*.bam
+*.bai
+*.fastq
+*.gz
+*.zip
+
+# Data and results folders
+data/
+raw_data/
+results/
+output/
+
+# =============================================================
+# OS clutter
+# =============================================================
+# Mac
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# =============================================================
+# Temp / log files
+# =============================================================
+*.tmp
+*.log
+*.out
