@@ -1,0 +1,230 @@
+---
+title: "Survival RE Analysis"
+author: "Chinaza Nnam"
+date: "2026-02-27"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+## Overview
+
+This script performs survival analysis on TCGA-KIRC samples stratified by RE methylation
+subtypes defined in `01_TCGA_REMP_RE_Analysis.Rmd`.
+
+It covers:
+
+1. Kaplan–Meier survival curves by NEMO subtype
+2. Median survival extraction per group
+3. Multivariable Cox proportional hazards models (AJCC stage and AUA risk groupings)
+4. Sensitivity analysis including race as a covariate
+5. Forest plot visualising hazard ratios across models
+
+**Required input objects (carried over from `01_TCGA_REMP_RE_Analysis.Rmd`):**
+- `pheno2` — phenotype table with columns: `OS`, `vital_status`, `NEMO`, `age`, `sex`,
+  `stage`, `AUA_risk_group`, `Immune`, `Angio`, `race`
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.path = "results/figures/"
+)
+```
+
+---
+
+## Load Packages
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(survival)   # Surv(), survfit(), coxph()
+  library(survminer)  # ggsurvplot()
+  library(dplyr)      # data wrangling
+  library(tibble)     # rownames_to_column()
+  library(broom)      # tidy model outputs
+  library(ggplot2)    # forest plot
+})
+```
+
+---
+
+## Step 1: Kaplan–Meier Survival Analysis
+
+Fit KM curves stratified by NEMO subtype and plot with p-value and risk table.
+Colours: green = Repressed, amber = Transient, red = Active.
+
+```{r km-curve}
+# Fit KM curves for each NEMO subtype using overall survival (OS, years)
+fit_km <- survfit(Surv(OS, vital_status) ~ NEMO, data = pheno2)
+
+ggsurvplot(
+  fit_km,
+  data         = pheno2,
+  pval         = TRUE,           # log-rank p-value
+  risk.table   = TRUE,           # number at risk below plot
+  palette      = c("#117733", "#fda000", "#ae2029"),  # Repressed, Transient, Active
+  legend.title = "RE Subtype",
+  xlab         = "Time (Years)",
+  ylab         = "Survival Probability",
+  title        = "Overall Survival by RE Methylation Subtype (TCGA-KIRC, k=3)"
+)
+```
+
+---
+
+## Step 2: Median Survival per Group
+
+```{r median-survival}
+# Extract median survival time and 95% CI for each NEMO group
+median_surv <- summary(fit_km)$table %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Group") %>%
+  transmute(
+    NEMO_Group            = sub("^NEMO=", "", Group),
+    Median_Survival_years = median,
+    Lower_95CI            = `0.95LCL`,
+    Upper_95CI            = `0.95UCL`
+  )
+
+median_surv
+```
+
+---
+
+## Step 3: Multivariable Cox Proportional Hazards Models
+
+Four models are tested using two staging systems (AJCC and AUA risk group), each with and
+without immune/angiogenic cell fraction adjustment from HiTIMED:
+
+- **Model 1A:** NEMO + age + sex + AJCC stage
+- **Model 1B:** Model 1A + scaled Immune + Angio fractions
+- **Model 2A:** NEMO + age + sex + AUA risk group
+- **Model 2B:** Model 2A + scaled age + scaled Immune + Angio fractions
+
+```{r cox-models}
+# Model 1A: AJCC stage adjustment only
+fit_Model1A <- coxph(Surv(OS, vital_status) ~ NEMO + age + sex + stage,
+                     data = pheno2)
+
+# Model 1B: AJCC stage + immune microenvironment adjustment
+fit_Model1B <- coxph(Surv(OS, vital_status) ~ NEMO + age + sex + stage +
+                       scale(Immune) + scale(Angio),
+                     data = pheno2)
+
+# Model 2A: AUA risk group adjustment only
+fit_Model2A <- coxph(Surv(OS, vital_status) ~ NEMO + age + sex + AUA_risk_group,
+                     data = pheno2)
+
+# Model 2B: AUA risk group + scaled covariates + immune microenvironment adjustment
+fit_Model2B <- coxph(Surv(OS, vital_status) ~ NEMO + scale(age) + sex + AUA_risk_group +
+                       scale(Immune) + scale(Angio),
+                     data = pheno2)
+
+# Print summaries
+summary(fit_Model1A)
+summary(fit_Model1B)
+summary(fit_Model2A)
+summary(fit_Model2B)
+```
+
+---
+
+## Step 4: Sensitivity Analysis — Race Inclusion
+
+Race was tested as an additional covariate. It did not significantly alter model estimates
+and was excluded from primary models to preserve statistical power.
+
+```{r sensitivity-race}
+# Sensitivity model: AUA risk group + immune fractions + race
+fit_race <- coxph(Surv(OS, vital_status) ~ NEMO + scale(age) + sex + AUA_risk_group +
+                    scale(Immune) + scale(Angio) + race,
+                  data = pheno2)
+
+summary(fit_race)
+```
+
+---
+
+## Step 5: Extract Hazard Ratios for Active vs Repressed (Reference)
+
+A helper function extracts HR, 95% CI, and p-value for the Active NEMO contrast from any
+Cox model. Repressed is the reference level.
+
+```{r extract-hr-function}
+# Helper: extracts HR, CI, and p-value for the Active NEMO contrast
+# model       — a fitted coxph object
+# nemo_term   — prefix used to identify NEMO rows in the coefficient table
+extract_nemo_hr <- function(model, nemo_term = "NEMO") {
+  sm        <- summary(model)
+  nemo_rows <- grep(paste0("^", nemo_term), rownames(sm$coefficients))
+  active_row <- grep("Active", rownames(sm$coefficients)[nemo_rows], value = TRUE)
+
+  if (length(active_row) == 0) stop("Active level not found in model coefficients.")
+
+  coef_row <- sm$coefficients[active_row, ]
+  ci_row   <- sm$conf.int[active_row, ]
+
+  data.frame(
+    term  = active_row,
+    HR    = ci_row["exp(coef)"],
+    lower = ci_row["lower .95"],
+    upper = ci_row["upper .95"],
+    pval  = coef_row["Pr(>|z|)"],
+    row.names = NULL
+  )
+}
+
+# Extract HRs from each model
+res1 <- extract_nemo_hr(fit_Model1A)
+res2 <- extract_nemo_hr(fit_Model1B)
+res3 <- extract_nemo_hr(fit_Model2A)
+res4 <- extract_nemo_hr(fit_Model2B)
+
+# Combine into a single data frame for plotting
+forest_df <- rbind(
+  cbind(Model = "Model 1A", res1),
+  cbind(Model = "Model 1B", res2),
+  cbind(Model = "Model 2A", res3),
+  cbind(Model = "Model 2B", res4)
+)
+
+# Set factor levels so models display top-to-bottom in correct order on the forest plot
+forest_df$Model <- factor(forest_df$Model,
+                          levels = rev(c("Model 1A", "Model 1B", "Model 2A", "Model 2B")))
+
+forest_df
+```
+
+---
+
+## Step 6: Forest Plot of Hazard Ratios Across Models
+
+Each point = HR for Active vs Repressed; bars = 95% CI.
+Dashed red line at HR = 1 (no effect). All models adjust for at least age, sex, and a
+staging variable.
+
+```{r forest-plot}
+ggplot(forest_df, aes(x = Model, y = HR, ymin = lower, ymax = upper)) +
+  geom_pointrange(size = 0.8) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  coord_flip() +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Hazard Ratios for Active RE Subtype Across Models\n(Reference: Repressed)",
+    y     = "Hazard Ratio (HR)",
+    x     = ""
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text  = element_text(color = "black")
+  )
+
+# Uncomment to save:
+# ggsave(filename = "results/figures/forest_plot_HR.pdf", width = 7, height = 4)
+```

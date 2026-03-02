@@ -1,0 +1,695 @@
+---
+title: "TCGA REMP Retroelement Analysis"
+author: "Chinaza Nnam"
+date: "2026-02-27"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+## Overview
+
+This script performs repetitive element (RE) methylation analysis on TCGA-KIRC data using REMP
+predictions. It covers:
+
+1. REMP annotation and prediction for Alu, L1, and LTR families
+2. Trimming, aggregation, and KNN imputation of predicted beta/M values
+3. Multi-omics integrative clustering (MOVICS/NEMO) to define RE methylation subtypes
+4. Phenotype preparation and HiTIMED immune deconvolution
+5. Differential methylation analysis (DMA) across subtypes
+6. Genomic annotation of significant hits
+
+**Required input objects (must be loaded before running):**
+- `betas` — QC'ed CpG beta matrix (samples × CpGs) from TCGA-KIRC
+- `pheno` — phenotype table with columns: `cases`, `basename`, `submitter_id`,
+  `days_to_death`, `days_to_last_follow_up`, `vital_status`, `ajcc_pathologic_stage`,
+  `tumor_grade`, `age_at_index`, `gender`, `race`
+
+**Outputs flow into:** `02_Survival_RE_Analysis.Rmd` and
+`03_Hypoxia_ImmuneResponse_Signatures_RE_Analysis.Rmd`
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.path = "results/figures/"   # all figures saved here automatically
+)
+
+# Create required output directories if they don't already exist
+dir.create("data",            showWarnings = FALSE, recursive = TRUE)
+dir.create("results",         showWarnings = FALSE, recursive = TRUE)
+dir.create("results/figures", showWarnings = FALSE, recursive = TRUE)
+```
+
+---
+
+## Load Packages
+
+```{r packages}
+# Data wrangling
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# REMP methylation prediction and imputation
+library(REMP)
+library(impute)
+
+# Multi-omics integrative clustering
+library(MOVICS)
+
+# Survival analysis
+library(survival)
+library(survminer)
+library(broom)
+
+# Differential methylation (EWAS)
+library(limma)
+
+# Genomic range overlaps for annotation
+library(GenomicRanges)
+
+# Summary tables
+library(tableone)
+
+# Volcano plots — uncomment if EnhancedVolcano is installed
+# library(EnhancedVolcano)
+
+# Additional optional packages (uncomment as needed):
+# library(ggpubr)
+# library(rstatix)
+# library(GSVA)
+# library(BiocParallel)
+# library(VIM)
+# library(matrixStats)
+```
+
+---
+
+## Helper Functions
+
+All custom utility functions are defined here so they can be reused throughout the script.
+
+```{r helper-functions}
+# --- Path helpers ---
+# Prepend "data/" or "results/" to a filename for consistent file I/O
+p_data <- function(x) file.path("data", x)
+p_res  <- function(x) file.path("results", x)
+
+# --- Column name cleaner ---
+# Strips a leading "X" that R sometimes adds to numeric column names (e.g. "X123" → "123")
+removeX <- function(mat) {
+  colnames(mat) <- gsub("^X", "", colnames(mat))
+  mat
+}
+
+# --- KNN imputation wrapper ---
+# Runs impute.knn() with consistent defaults across all matrices in this project
+# rowmax/colmax: maximum proportion of missing values allowed per row/column before removal
+impute_knn_mat <- function(mat, k = 10, rowmax = 0.5, colmax = 0.8) {
+  out <- impute.knn(as.matrix(mat), k = k, rowmax = rowmax, colmax = colmax)
+  out$data
+}
+
+# --- Logit (beta → M-value) transform ---
+# Converts beta values (0–1) to M-values (-Inf to +Inf) for linear modelling
+# eps clips values away from 0 and 1 to avoid log(0) = -Inf
+logit_beta <- function(beta, eps = 1e-6) {
+  beta <- pmin(pmax(beta, eps), 1 - eps)
+  log2(beta / (1 - beta))
+}
+
+# --- Extract hazard ratio from Cox model for a specific NEMO cluster ---
+# Returns HR, 95% CI, and p-value as a tidy data frame
+extract_nemo_hr <- function(model, nemo_prefix = "NEMO", level_pattern = "Active") {
+  sm  <- summary(model)
+  rn  <- rownames(sm$coefficients)
+  nemo_rows <- grep(paste0("^", nemo_prefix), rn, value = TRUE)
+  target    <- grep(level_pattern, nemo_rows, value = TRUE)
+  if (length(target) == 0) stop("Requested NEMO level not found in model coefficients.")
+  coef_row <- sm$coefficients[target[1], ]
+  ci_row   <- sm$conf.int[target[1], ]
+  data.frame(
+    term  = target[1],
+    HR    = unname(ci_row["exp(coef)"]),
+    lower = unname(ci_row["lower .95"]),
+    upper = unname(ci_row["upper .95"]),
+    pval  = unname(coef_row["Pr(>|z|)"]),
+    row.names = NULL
+  )
+}
+
+# --- Tidy Cox model output for forest plots ---
+# Exponentiates coefficients (→ HR) and adds a label column for multi-model comparisons
+tidy_models <- function(model, label) {
+  broom::tidy(model, exponentiate = TRUE, conf.int = TRUE) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(Model = label)
+}
+
+# --- Genomic overlap join ---
+# Joins an annotation data frame to an RE position data frame based on genomic overlap
+# Returns one row per overlapping pair with columns from both data frames
+overlap_join_annotations <- function(annot_df, re_df) {
+  gr_annot <- GRanges(
+    seqnames = annot_df$seqnames,
+    ranges   = IRanges(start = annot_df$start, end = annot_df$end),
+    strand   = if ("strand" %in% names(annot_df)) annot_df$strand else "*"
+  )
+  mcols(gr_annot) <- annot_df %>% select(-seqnames, -start, -end, -strand)
+
+  gr_re <- GRanges(
+    seqnames = re_df$seqnames,
+    ranges   = IRanges(start = re_df$start, end = re_df$end),
+    strand   = if ("strand" %in% names(re_df)) re_df$strand else "*"
+  )
+  mcols(gr_re) <- re_df %>% select(-seqnames, -start, -end, -strand)
+
+  ov <- findOverlaps(gr_re, gr_annot, ignore.strand = TRUE)
+  bind_cols(
+    as.data.frame(gr_re[queryHits(ov)]),
+    as.data.frame(mcols(gr_annot)[subjectHits(ov), ])
+  )
+}
+```
+
+---
+
+## Check Required Inputs
+
+```{r check-inputs}
+# Stop early with a helpful message if required objects are not in the environment.
+# Load betas and pheno from your data/ folder before running this notebook.
+required <- c("betas", "pheno")
+missing  <- required[!vapply(required, exists, logical(1))]
+if (length(missing) > 0) {
+  stop(
+    "Missing required objects: ", paste(missing, collapse = ", "),
+    ". Please load them into your R environment before knitting."
+  )
+}
+```
+
+---
+
+## Step 1: Build REMP Annotations
+
+REMP requires pre-built annotation parcels for each RE family. These are cached to `data/` so
+they only need to be downloaded once — subsequent runs load from disk.
+
+```{r remp-annotations}
+alu_rda <- p_data("remparcelAlu_450k_hg38.rda")
+l1_rda  <- p_data("remparcelL1_450k_hg38.rda")
+ltr_rda <- p_data("remparcelLTR_450k_hg38.rda")
+
+# Alu
+if (!file.exists(alu_rda)) {
+  remparcelAlu <- initREMP(arrayType = "450k", REtype = "Alu",
+                           annotation.source = "AH", genome = "hg38", ncore = 5)
+  save(remparcelAlu, file = alu_rda)
+} else {
+  load(alu_rda)
+}
+
+# L1
+if (!file.exists(l1_rda)) {
+  remparcelL1 <- initREMP(arrayType = "450k", REtype = "L1",
+                          annotation.source = "AH", genome = "hg38", ncore = 5)
+  save(remparcelL1, file = l1_rda)
+} else {
+  load(l1_rda)
+}
+
+# LTR (ERV family)
+if (!file.exists(ltr_rda)) {
+  remparcelLTR <- initREMP(arrayType = "450k", REtype = "ERV",
+                           annotation.source = "AH", genome = "hg38", ncore = 5)
+  save(remparcelLTR, file = ltr_rda)
+} else {
+  load(ltr_rda)
+}
+```
+
+---
+
+## Step 2: Run REMP Predictions
+
+REMP predicts methylation levels at RE loci using nearby CpGs from the array as predictors.
+Results are cached to `data/` for reproducibility.
+betas = your hiTAIC QC'ed and ENmix Preprocessed and Q'Ced beta matrix for tcga tumors
+```{r remp-predictions}
+alu_out <- p_data("remp.resAlu_tcga.rda")
+l1_out  <- p_data("remp.resL1_tcga.rda")
+ltr_out <- p_data("remp.resLTR_tcga.rda")
+
+if (!file.exists(alu_out)) {
+  remp.resAlu <- remp(betas, REtype = "Alu", parcel = remparcelAlu, ncore = 20, seed = 777)
+  save(remp.resAlu, file = alu_out)
+} else load(alu_out)
+
+if (!file.exists(l1_out)) {
+  remp.resL1 <- remp(betas, REtype = "L1", parcel = remparcelL1, ncore = 20, seed = 777)
+  save(remp.resL1, file = l1_out)
+} else load(l1_out)
+
+if (!file.exists(ltr_out)) {
+  remp.resLTR <- remp(betas, REtype = "ERV", parcel = remparcelLTR, ncore = 20, seed = 777)
+  save(remp.resLTR, file = ltr_out)
+} else load(ltr_out)
+```
+
+---
+
+## Step 3: Trim, Aggregate, Extract Matrices, and Impute
+
+- **Trim:** removes low-confidence predictions (reliability score threshold = 1.7) and loci with
+  >20% missing values
+- **Aggregate:** collapses predictions to RE locus level, requiring ≥2 CpGs per locus
+- **Impute:** KNN imputation fills remaining missing values
+
+```{r trim-aggregate-impute}
+# Trim low-quality predictions
+remp.resAlu2 <- rempTrim(remp.resAlu, threshold = 1.7, missingRate = 0.2)
+remp.resL12  <- rempTrim(remp.resL1,  threshold = 1.7, missingRate = 0.2)
+remp.resLTR2 <- rempTrim(remp.resLTR, threshold = 1.7, missingRate = 0.2)
+
+# Aggregate to RE locus level (minimum 2 CpGs per locus)
+remp.resAluag <- rempAggregate(remp.resAlu2, NCpG = 2)
+remp.resL1ag  <- rempAggregate(remp.resL12,  NCpG = 2)
+remp.resLTRag <- rempAggregate(remp.resLTR2, NCpG = 2)
+
+# Extract beta (methylation proportion) and M-value (logit-transformed) matrices
+Alu_beta <- as.data.frame(remp.resAluag@assays@data$rempB)
+L1_beta  <- as.data.frame(remp.resL1ag@assays@data$rempB)
+LTR_beta <- as.data.frame(remp.resLTRag@assays@data$rempB)
+
+Alu_M <- as.data.frame(remp.resAluag@assays@data$rempM)
+L1_M  <- as.data.frame(remp.resL1ag@assays@data$rempM)
+LTR_M <- as.data.frame(remp.resLTRag@assays@data$rempM)
+
+# KNN imputation (k=10) for remaining missing values in beta and M matrices
+Alu_beta2 <- impute_knn_mat(Alu_beta)
+L1_beta2  <- impute_knn_mat(L1_beta)
+LTR_beta2 <- impute_knn_mat(LTR_beta)
+
+Alu_M2 <- impute_knn_mat(Alu_M)
+L1_M2  <- impute_knn_mat(L1_M)
+LTR_M2 <- impute_knn_mat(LTR_M)
+```
+
+---
+
+## Step 4: Select Elite Features and Run MOVICS Clustering
+
+The top 1,000 most variable loci per RE family (by MAD) are selected as features for clustering.
+Six algorithms are run; downstream analyses use NEMO as the primary assignment.
+
+```{r movics-clustering}
+# Select top 1,000 most variable loci per family using Median Absolute Deviation (MAD)
+Alu_1k <- getElites(dat = Alu_beta2, method = "mad", elite.num = 1000)
+L1_1k  <- getElites(dat = L1_beta2,  method = "mad", elite.num = 1000)
+LTR_1k <- getElites(dat = LTR_beta2, method = "mad", elite.num = 1000)
+
+# Assemble multi-omics input list
+mo.data <- list(
+  Alu = Alu_1k$elite.dat,
+  L1  = L1_1k$elite.dat,
+  LTR = LTR_1k$elite.dat
+)
+
+# Determine optimal cluster number (k=3 was selected based on this output)
+optk.RE <- getClustNum(
+  data        = mo.data,
+  try.N.clust = 2:8,
+  fig.name    = "CLUSTER_NUMBER_TCGA_KIRC_RE"
+)
+
+# Run 6 multi-omics clustering algorithms with k=3
+# All data types are continuous methylation values (gaussian distribution assumed)
+moic.res.list <- getMOIC(
+  data        = mo.data,
+  methodslist = list("SNF", "NEMO", "COCA", "ConsensusClustering", "IntNMF", "MoCluster"),
+  N.clust     = 3,
+  type        = c("gaussian", "gaussian", "gaussian")
+)
+
+# Uncomment to save clustering results for use in downstream scripts:
+# save(moic.res.list, file = p_data("moic.res.list.rda"))
+```
+
+---
+
+## Step 5: Consensus Clustering and Heatmap
+
+Consensus clustering aggregates results across all 6 algorithms to identify the most stable
+sample assignments. The heatmap visualises cluster structure after logit transformation and
+standardisation.
+
+```{r consensus-heatmap}
+# Consensus across all 6 algorithms — silhouette plot shows cluster stability
+consensus <- getConsensusMOIC(
+  moic.res.list = moic.res.list,
+  fig.name      = "CONSENSUS_HEATMAP",
+  distance      = "euclidean",
+  linkage       = "average"
+)
+
+getSilhouette(
+  sil      = consensus$sil,
+  fig.path = "results",
+  fig.name = "SILHOUETTE",
+  height   = 5.5,
+  width    = 5
+)
+
+# Logit-transform betas to M-values for heatmap (improves colour scaling)
+indata     <- mo.data
+indata$Alu <- logit_beta(indata$Alu)
+indata$L1  <- logit_beta(indata$L1)
+indata$LTR <- logit_beta(indata$LTR)
+
+# Standardise (centre + scale, truncate at ±2 SD to reduce outlier dominance)
+plotdata <- getStdiz(
+  data       = indata,
+  halfwidth  = c(2, 2, 2),
+  centerFlag = c(TRUE, TRUE, TRUE),
+  scaleFlag  = c(TRUE, TRUE, TRUE)
+)
+
+# Colour palette: light grey → black → maroon (low → mid → high methylation)
+Alu.col  <- c("grey90", "black", "#800000")
+L1.col   <- c("grey90", "black", "#800000")
+LTR.col  <- c("grey90", "black", "#800000")
+col.list <- list(Alu.col, L1.col, LTR.col)
+
+# Plot heatmap using NEMO cluster assignments as the primary subtype labels.
+# Repeat this call substituting clust.res / clust.dend for each of the other 5 algorithms
+# to visually compare their cluster structures.
+getMoHeatmap(
+  data        = plotdata,
+  row.title   = c("ALU", "L1", "LTR"),
+  is.binary   = c(FALSE, FALSE, FALSE),
+  legend.name = c("ALU", "L1", "LTR"),
+  clust.res   = moic.res.list$NEMO$clust.res,
+  clust.dend  = moic.res.list$NEMO$clust.dend,
+  color       = col.list,
+  width       = 10,
+  height      = 3,
+  fig.name    = "NEMO_COMPREHENSIVE_HEATMAP"
+)
+```
+
+---
+
+## Step 6: Prepare Phenotype Data and Merge Cluster Assignments
+
+```{r pheno-prep}
+# Slim the phenotype table to clinically relevant covariates only
+pheno2 <- pheno %>%
+  select(submitter_id, basename, days_to_death, days_to_last_follow_up,
+         days_to_recurrence, age_at_index, ajcc_pathologic_stage,
+         tumor_grade, vital_status, gender, race)
+
+# Confirm sample order matches between clustering output and phenotype table
+# before merging (must be TRUE to proceed)
+identical(moic.res.list$NEMO$clust.res$samID, pheno2$basename)
+
+# Add NEMO cluster assignment to phenotype table
+pheno2$NEMO <- moic.res.list$NEMO$clust.res$clust
+
+# Assign biologically meaningful subtype names based on heatmap observations:
+# Cluster 1 = Transient, 2 = Active, 3 = Repressed
+pheno2$NEMO <- dplyr::recode(pheno2$NEMO,
+  "1" = "Transient",
+  "2" = "Active",
+  "3" = "Repressed"
+)
+pheno2$NEMO <- factor(pheno2$NEMO, levels = c("Repressed", "Transient", "Active"))
+
+# Binary grouping: collapse Active + Transient vs Repressed for simpler comparisons
+pheno2$NEMO2 <- factor(
+  ifelse(pheno2$NEMO %in% c("Transient", "Active"), "Active_Transient", "Repressed"),
+  levels = c("Repressed", "Active_Transient")
+)
+
+# Remove samples with uninformative survival time (0 days) or missing stage/grade
+pheno2 <- pheno2 %>%
+  filter(OS != 0, !is.na(stage), !is.na(grade), grade != "GX")
+
+# Convert survival time from days to years; rename columns for readability
+pheno2$OS <- as.numeric(pheno2$days_to_last_follow_up) / 365
+pheno2 <- pheno2 %>%
+  rename(stage = ajcc_pathologic_stage, grade = tumor_grade,
+         age = age_at_index, sex = gender)
+
+# Encode vital status as numeric (0 = Alive, 1 = Dead) for survival models
+pheno2$vital_status <- as.numeric(ifelse(pheno2$vital_status == "Alive", 0, 1))
+
+# Standardise stage strings (replace spaces with underscores)
+pheno2$stage <- gsub(" ", "_", pheno2$stage)
+
+# Collapse race to binary (white vs others) due to small group sizes
+pheno2$race <- ifelse(pheno2$race == "white", "white", "others")
+```
+
+---
+
+## Step 7: HiTIMED Immune Deconvolution
+
+HiTIMED estimates tumour microenvironment cell type proportions from methylation data.
+Level 2 is used here to obtain three broad compartments: Tumour, Immune, and Angiogenic.
+
+```{r hitimed}
+# Run HiTIMED deconvolution for KIRC tumour samples (Level 2 = 3 compartments)
+hitimedT <- HiTIMED_deconvolution(betas, tumor_type = "KIRC", h = 2, tissue_type = "tumor")
+hitimedT$submitter_id <- rownames(hitimedT)
+
+# KNN imputation for any missing deconvolution estimates
+hitimedT_im      <- impute.knn(as.matrix(hitimedT), k = 10, rowmax = 0.5, colmax = 0.8)
+hitimedT_im      <- as.data.frame(hitimedT_im$data)
+
+# Add cell type proportion estimates to phenotype table
+pheno2$Tumor  <- hitimedT_im$Tumor
+pheno2$Immune <- hitimedT_im$Immune
+pheno2$Angio  <- hitimedT_im$Angiogenic
+
+# Create AUA risk grouping based on stage and grade
+pheno2 <- pheno2 %>%
+  mutate(
+    AUA_risk_group = case_when(
+      stage %in% c("Stage_I", "Stage_II") ~ "Low_Intermediate",
+      stage %in% c("Stage_III", "Stage_IV") ~ "High",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+---
+
+## Step 8: Differential Methylation Analysis (DMA)
+
+Linear models (limma) identify RE loci with significantly different methylation across subtypes,
+adjusting for age, sex, stage, and immune/angiogenic cell fractions.
+
+```{r dma}
+# Assign sample identifiers as column names across all M-value matrices
+colnames(Alu_M2) <- pheno$cases
+colnames(L1_M2)  <- pheno$cases
+colnames(LTR_M2) <- pheno$cases
+
+# Combine all three RE family M-value matrices into one for joint modelling
+RE_M <- rbind(Alu_M2, L1_M2, LTR_M2)
+
+# Design matrix: NEMO subtype + clinical covariates
+# agez, Immunez, Angioz are assumed to be z-scored continuous covariates
+design_M <- model.matrix(~ 0 + NEMO + agez + sex + stage + Immunez + Angioz, data = pheno2)
+colnames(design_M)[1:3] <- c("Repressed", "Transient", "Active")
+
+fit_M <- lmFit(RE_M, design_M)
+
+# Define pairwise contrasts between the three subtypes
+contrast_M <- makeContrasts(
+  TR = Transient - Repressed,   # Transient vs Repressed
+  AR = Active - Repressed,      # Active vs Repressed (primary comparison)
+  AT = Active - Transient,      # Active vs Transient
+  levels = design_M
+)
+
+fit1_M <- eBayes(contrasts.fit(fit_M, contrast_M))
+
+# Extract significant hits per contrast (FDR < 0.1, |logFC| > 0.2 for TR; FDR < 0.01 for AR/AT)
+fit_M_TR <- topTable(fit1_M, coef = "TR", number = Inf,
+                     adjust.method = "fdr", p.value = 0.1,  lfc = 0.2) %>%
+  tibble::rownames_to_column("Pos")
+
+fit_M_AR <- topTable(fit1_M, coef = "AR", number = Inf,
+                     adjust.method = "fdr", p.value = 0.01, lfc = 0.2) %>%
+  tibble::rownames_to_column("Pos")
+
+fit_M_AT <- topTable(fit1_M, coef = "AT", number = Inf,
+                     adjust.method = "fdr", p.value = 0.01, lfc = 0.2) %>%
+  tibble::rownames_to_column("Pos")
+
+# Combine all significant hits across contrasts (deduplicated by position)
+combined_fits <- bind_rows(fit_M_TR, fit_M_AR, fit_M_AT) %>%
+  distinct(Pos, .keep_all = TRUE)
+
+# Uncomment to export:
+# write.csv(combined_fits, file = p_res("EWAS_part1_combined_hits.csv"), row.names = FALSE)
+```
+
+---
+
+## Step 9: Volcano Plot (Active vs Repressed)
+
+```{r volcano}
+# Requires EnhancedVolcano — uncomment library() above if not loaded
+# volcano1 <- EnhancedVolcano(
+#   fit_M_AR,
+#   lab        = rownames(fit_M_AR),
+#   x          = "logFC",
+#   y          = "adj.P.Val",
+#   col        = c("grey30", "grey30", "grey30", "maroon"),
+#   title      = "Active vs Repressed",
+#   pCutoff    = 0.05,
+#   FCcutoff   = 1,
+#   xlim       = c(-2, 2),
+#   ylim       = c(0, 40)
+# ) +
+#   theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+# volcano1
+```
+
+---
+
+## Step 10: Extract Gene Annotations from REMP Parcels
+
+Gene symbols and genomic coordinates are pulled from the REMP annotation parcels
+for each RE family.
+
+```{r remp-annotations-extract}
+# Extract RefGene and RE position annotations from each parcel object
+Alu_annot      <- as.data.frame(remparcelAlu@RefGene)
+Alu_annot_REpos <- as.data.frame(remparcelAlu@RE)
+
+L1_annot       <- as.data.frame(remparcelL1@RefGene)
+L1_annot_REpos  <- as.data.frame(remparcelL1@RE)
+
+LTR_annot      <- as.data.frame(remparcelLTR@RefGene)
+LTR_annot_REpos <- as.data.frame(remparcelLTR@RE)
+```
+
+---
+
+## Step 11: Genomic Overlap to Map RE Hits to Genes
+
+For each RE family, narrow RE locus positions are overlapped with the broader RefGene
+annotation intervals to assign gene symbols and chromosomal context to each hit.
+
+```{r genomic-overlap}
+# --- Alu ---
+gr_alu <- GRanges(
+  seqnames = Alu_annot$seqnames,
+  ranges   = IRanges(start = Alu_annot$start, end = Alu_annot$end),
+  strand   = if ("strand" %in% names(Alu_annot)) Alu_annot$strand else "*"
+)
+mcols(gr_alu) <- Alu_annot %>% select(-seqnames, -start, -end, -strand)
+
+gr_pos <- GRanges(
+  seqnames = Alu_annot_REpos$seqnames,
+  ranges   = IRanges(start = Alu_annot_REpos$start, end = Alu_annot_REpos$end),
+  strand   = if ("strand" %in% names(Alu_annot_REpos)) Alu_annot_REpos$strand else "*"
+)
+mcols(gr_pos) <- Alu_annot_REpos %>% select(-seqnames, -start, -end, -strand)
+
+ov <- findOverlaps(gr_pos, gr_alu, ignore.strand = TRUE)
+Alu_ewas_annot <- bind_cols(
+  as.data.frame(gr_pos[queryHits(ov)]),
+  as.data.frame(mcols(gr_alu)[subjectHits(ov), ])
+)
+
+# --- L1 ---
+gr_L1 <- GRanges(
+  seqnames = L1_annot$seqnames,
+  ranges   = IRanges(start = L1_annot$start, end = L1_annot$end),
+  strand   = if ("strand" %in% names(L1_annot)) L1_annot$strand else "*"
+)
+mcols(gr_L1) <- L1_annot %>% select(-seqnames, -start, -end, -strand)
+
+gr_pos <- GRanges(
+  seqnames = L1_annot_REpos$seqnames,
+  ranges   = IRanges(start = L1_annot_REpos$start, end = L1_annot_REpos$end),
+  strand   = if ("strand" %in% names(L1_annot_REpos)) L1_annot_REpos$strand else "*"
+)
+mcols(gr_pos) <- L1_annot_REpos %>% select(-seqnames, -start, -end, -strand)
+
+ov <- findOverlaps(gr_pos, gr_L1, ignore.strand = TRUE)
+L1_ewas_annot <- bind_cols(
+  as.data.frame(gr_pos[queryHits(ov)]),
+  as.data.frame(mcols(gr_L1)[subjectHits(ov), ])
+)
+
+# --- LTR ---
+gr_LTR <- GRanges(
+  seqnames = LTR_annot$seqnames,
+  ranges   = IRanges(start = LTR_annot$start, end = LTR_annot$end),
+  strand   = if ("strand" %in% names(LTR_annot)) LTR_annot$strand else "*"
+)
+mcols(gr_LTR) <- LTR_annot %>% select(-seqnames, -start, -end, -strand)
+
+gr_pos <- GRanges(
+  seqnames = LTR_annot_REpos$seqnames,
+  ranges   = IRanges(start = LTR_annot_REpos$start, end = LTR_annot_REpos$end),
+  strand   = if ("strand" %in% names(LTR_annot_REpos)) LTR_annot_REpos$strand else "*"
+)
+mcols(gr_pos) <- LTR_annot_REpos %>% select(-seqnames, -start, -end, -strand)
+
+ov <- findOverlaps(gr_pos, gr_LTR, ignore.strand = TRUE)
+LTR_ewas_annot <- bind_cols(
+  as.data.frame(gr_pos[queryHits(ov)]),
+  as.data.frame(mcols(gr_LTR)[subjectHits(ov), ])
+)
+```
+
+---
+
+## Step 12: Annotate DMA Results
+
+Significant DMA hits are joined with genomic annotations to produce interpretable output
+tables with gene symbols, RE family/class, and chromosomal positions.
+
+```{r annotate-dma-results}
+# Subset each annotation table to positions present in the combined significant hits
+Alu_res  <- Alu_ewas_annot[Alu_ewas_annot$Index %in% combined_fits$Pos, ]
+L1_res   <- L1_ewas_annot[L1_ewas_annot$Index   %in% combined_fits$Pos, ]
+LTR_res  <- LTR_ewas_annot[LTR_ewas_annot$Index %in% combined_fits$Pos, ]
+Res_annot <- rbind(Alu_res, L1_res, LTR_res)
+
+# Active vs Repressed annotated results (primary comparison)
+Alu_ARres  <- Alu_ewas_annot[Alu_ewas_annot$Index %in% fit_M_AR$Pos, ]
+L1_ARres   <- L1_ewas_annot[L1_ewas_annot$Index   %in% fit_M_AR$Pos, ]
+LTR_ARres  <- LTR_ewas_annot[LTR_ewas_annot$Index %in% fit_M_AR$Pos, ]
+Res_ARannot <- rbind(Alu_ARres, L1_ARres, LTR_ARres)
+
+# Merge with logFC and p-value from DMA
+Res_ARannot <- merge(
+  Res_ARannot,
+  fit_M_AR[, c("Pos", "logFC", "P.Value")],
+  by.x = "Index", by.y = "Pos"
+)
+
+# Select key columns and remove duplicate genomic positions
+Res_ARannot2 <- Res_ARannot %>%
+  dplyr::select(Index, seqnames, start, end, repClass, repFamily, GeneSymbol, logFC, P.Value) %>%
+  filter(!duplicated(start))
+
+Res_ARannot2
+
+# Uncomment to export:
+# write.csv(Res_ARannot2, file = p_res("Res_ARannot2_ActiveVsRepressed.csv"), row.names = FALSE)
+```

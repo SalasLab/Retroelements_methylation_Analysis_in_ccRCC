@@ -1,0 +1,113 @@
+---
+title: "Validation Cohort Analysis"
+author: "CN"
+date: "2026-02-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+This script performs multi-omics integrative clustering (MOVICS/NEMO) on CPTAC validation cohort 
+DNA methylation data for repetitive element (RE) families: **Alu**, **L1**, and **LTR**.
+
+**Prerequisites:** REMP predictions and QC must be run on the CPTAC beta matrix prior to this 
+script, following the same pipeline as in `TCGA_REMP_RE_Analysis`. The CPTAC beta matrix should 
+be subsetted to CpGs present in the 450k array landscape. All CPTAC-derived objects are named 
+with the suffix `_cp`.
+
+**Downstream:** After clustering, merge results with phenotype data and proceed to survival and 
+immune/hypoxia signature analyses as in:
+- `Survival_RE_Analysis`
+- `Hypoxia_ImmuneResponse_Signatures_Analysis`
+
+---
+
+## Step 1: Identify Common CpGs Between TCGA and CPTAC
+
+Combine the top 1,000 elite CpGs from each RE family in the TCGA results, then subset the 
+corresponding CPTAC beta matrices to retain only those CpGs. This ensures the validation cohort 
+uses the same features identified in the discovery cohort.
+
+```{r common-cpgs}
+# Combine top 1k elite CpGs across all three RE families from TCGA discovery cohort
+RE_tcga <- rbind(Alu_1k$elite.dat, L1_1k$elite.dat, LTR_1k$elite.dat)
+
+# Subset each CPTAC RE beta matrix to retain only CpGs present in the TCGA top 1k set
+common_Alu <- Alu_beta2[rownames(Alu_beta2) %in% rownames(RE_tcga), ]
+common_L1  <- L1_beta2[rownames(L1_beta2)   %in% rownames(RE_tcga), ]
+common_LTR <- LTR_beta2[rownames(LTR_beta2) %in% rownames(RE_tcga), ]
+```
+
+---
+
+## Step 2: Multi-Omics Integrative Clustering (NEMO)
+
+Assemble the multi-omics data list and run NEMO clustering with k = 3, matching the cluster 
+number used in the TCGA discovery cohort. `getClustNum()` is commented out as the optimal 
+cluster number has already been determined.
+
+```{r nemo-clustering}
+# Assemble multi-omics input list for MOVICS
+mo.data_valid <- list(Alu = common_Alu, L1 = common_L1, LTR = common_LTR)
+
+# NOTE: Optimal cluster number (k=3) was determined in the TCGA discovery cohort.
+# Uncomment below to re-evaluate if needed:
+# optk.RE <- getClustNum(data        = mo.data_valid,
+#                        is.binary   = c(F, F, F),
+#                        try.N.clust = 2:8)
+
+# Run NEMO clustering with k=3; all three data types are continuous (gaussian)
+moic.res.list_valid <- getMOIC(data        = mo.data_valid,
+                               methodslist = list("NEMO"),
+                               N.clust     = 3,
+                               type        = c("gaussian", "gaussian", "gaussian"))
+```
+
+---
+
+## Step 3: Logit Transform Beta Values and Normalise for Heatmap
+
+Beta values (range 0–1) are logit-transformed to M-values (range −∞ to +∞) prior to 
+standardisation, which improves statistical properties for visualisation. The standardised 
+data are then used to generate a multi-omics heatmap.
+
+```{r logit-transform-and-heatmap}
+# Copy the multi-omics list to avoid modifying the original beta matrices
+indata_valid <- mo.data_valid
+
+# Logit-transform beta values to M-values: log2(beta / (1 - beta))
+# This linearises the scale and is preferred for methylation visualisation
+indata_valid$Alu <- log2(indata_valid$Alu / (1 - indata_valid$Alu))
+indata_valid$L1  <- log2(indata_valid$L1  / (1 - indata_valid$L1))
+indata_valid$LTR <- log2(indata_valid$LTR / (1 - indata_valid$LTR))
+
+# Standardise (centre and scale) each data type for heatmap visualisation
+# halfwidth = 2 truncates extreme values at ±2 SD to reduce colour saturation from outliers
+plotdata_valid <- getStdiz(data       = indata_valid,
+                           halfwidth  = c(2, 2, 2),
+                           centerFlag = c(T, T, T),
+                           scaleFlag  = c(T, T, T))
+
+# Generate multi-omics heatmap annotated with NEMO cluster assignments
+getMoHeatmap(data        = plotdata_valid,
+             row.title   = c("ALU", "L1", "LTR"),
+             is.binary   = c(F, F, F),
+             legend.name = c("ALU", "L1", "LTR"),
+             clust.res   = moic.res.list_valid$NEMO$clust.res,  # cluster membership
+             clust.dend  = moic.res.list_valid$NEMO$clust.dend, # dendrogram
+             color       = col.list)
+```
+
+---
+
+## Next Steps
+
+Merge `moic.res.list_valid$NEMO$clust.res` with the CPTAC phenotype (`pheno`) data and 
+proceed to downstream analyses:
+
+- **`Survival_RE_Analysis`** — Kaplan–Meier and Cox regression by cluster
+- **`Hypoxia_ImmuneResponse_Signatures_Analysis`** — Signature scoring by cluster

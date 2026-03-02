@@ -1,0 +1,288 @@
+---
+title: "Hypoxia and Immune Response Signatures — RE Analysis"
+author: "Chinaza Nnam"
+date: "2026-02-27"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+## Overview
+
+This script characterises the tumour microenvironment and immune/hypoxia gene expression
+signatures across RE methylation subtypes (NEMO clusters) defined in
+`01_TCGA_REMP_RE_Analysis.Rmd`.
+
+It covers:
+
+1. HiTIMED deconvolution at 12-cell-type resolution (h = 6)
+2. Alignment of TCGA-KIRC methylation and RNA-seq (TPM) samples
+3. Extraction of hypoxia (EPAS1, HIF1A) and immune checkpoint (PDCD1) gene expression
+4. ssGSEA scoring for cGAS-STING, interferon-stimulated genes (ISG), and T cell
+   exhaustion (terminal and progenitor) signatures
+5. Violin/boxplots comparing signatures across RE subtypes
+
+**Required input objects (carried over from `01_TCGA_REMP_RE_Analysis.Rmd`):**
+- `betas` — CpG beta matrix used for REMP predictions to be used for HiTIMED too
+- `pheno2` — phenotype table with NEMO assignments and clinical covariates
+- `tcga_tpm` — gene × sample TPM matrix for TCGA-KIRC RNA-seq
+- `pheno_methrna` — phenotype table pre-filtered to samples with both methylation and RNA-seq data
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.path = "results/figures/"
+)
+```
+
+---
+
+## Load Packages
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(dplyr)         # data wrangling
+  library(tidyr)         # reshaping
+  library(ggplot2)       # base plotting
+  library(ggpubr)        # geom_pwc() pairwise comparisons
+  library(survival)      # survival objects
+  library(survminer)     # KM plots
+  library(GSVA)          # ssGSEA scoring
+  library(BiocParallel)  # parallel backend for GSVA
+  library(tibble)        # rownames_to_column()
+})
+```
+
+---
+
+## Step 1: HiTIMED Deconvolution at 12-Cell-Type Resolution
+
+Running HiTIMED at hierarchy level 6 (h = 6) returns 12 immune/stromal cell type proportions.
+These are joined onto `pheno2` to create `pheno_hi` for downstream cell-type comparisons.
+
+```{r hitimed-12ct}
+# Run HiTIMED at h=6 for 12-cell-type resolution on TCGA-KIRC tumour samples
+hitimed12 <- HiTIMED_deconvolution(betas, tumor_type = "KIRC", h = 6, tissue_type = "tumor")
+
+# Use rownames (sample IDs) as a join key
+hitimed12$submitter_id <- rownames(hitimed12)
+
+# Merge 12-cell-type proportions with the primary phenotype table
+pheno_hi <- left_join(pheno2, hitimed12, by = "submitter_id")
+```
+
+---
+
+## Step 2: Align Methylation and RNA-seq Samples
+
+Only samples with both methylation and RNA-seq data are retained for gene expression analyses.
+`pheno_methrna` must already exist as a pre-filtered phenotype table; this step confirms
+alignment and adds HiTIMED cell type proportions.
+
+```{r align-methrna}
+# Identify samples present in both the phenotype table and the TPM matrix
+common_ids <- intersect(pheno_methrna$submitter_id, colnames(tcga_tpm))
+
+# Subset TPM matrix and phenotype table to shared samples only
+tpm_methrna  <- tcga_tpm[, common_ids]
+pheno_methrna <- pheno2[match(common_ids, pheno2$submitter_id), ]
+
+# Confirm column order in TPM matches row order in phenotype (required for downstream models)
+stopifnot(all(colnames(tpm_methrna) == pheno_methrna$submitter_id))
+
+# Add 12-cell-type HiTIMED proportions to the aligned phenotype table
+pheno_methrna <- left_join(pheno_methrna, hitimed12, by = "submitter_id")
+```
+
+---
+
+## Step 3: Extract Hypoxia and Checkpoint Gene Expression
+
+EPAS1 (HIF-2α), HIF1A (HIF-1α), and PDCD1 (PD-1) TPM values are pulled directly from the
+aligned TPM matrix and added as columns to `pheno_methrna` for boxplot comparisons.
+
+```{r extract-gene-expression}
+# Genes of interest: hypoxia transcription factors and immune checkpoint marker
+hifs_pd1 <- c("EPAS1", "HIF1A", "PDCD1")
+
+# Confirm all genes are present in the TPM matrix before subsetting
+missing_genes <- setdiff(hifs_pd1, rownames(tpm_methrna))
+if (length(missing_genes) > 0) {
+  warning("The following genes were not found in tpm_methrna: ",
+          paste(missing_genes, collapse = ", "))
+}
+
+# Transpose the gene subset so samples are rows, then join to phenotype by submitter_id
+tpm_genes <- as.data.frame(t(tpm_methrna[intersect(hifs_pd1, rownames(tpm_methrna)), ,
+                                          drop = FALSE]))
+tpm_genes$submitter_id <- rownames(tpm_genes)
+
+pheno_methrna <- left_join(pheno_methrna, tpm_genes, by = "submitter_id")
+```
+
+---
+
+## Step 4: ssGSEA Scoring
+
+Single-sample GSEA (ssGSEA) scores are computed for four immune/hypoxia gene sets.
+Each score reflects the relative enrichment of that pathway in each individual sample.
+
+**Gene sets:**
+- **cGAS-STING** — innate DNA-sensing pathway
+- **ISG** — interferon-stimulated gene response
+- **Terminal exhaustion** — dysfunctional T cell markers (TOX, PDCD1, HAVCR2, etc.)
+- **Progenitor exhaustion** — stem-like exhausted T cell markers (TCF7, CCR7, etc.)
+
+```{r define-gene-sets}
+# cGAS-STING innate immune sensing pathway
+cgas <- c("CGAS", "STING1", "TBK1", "IKBKE", "IRF3", "POLG", "TREX1", "ENPP1")
+
+# Interferon-stimulated genes (ISG) — broad antiviral transcriptional response
+isg <- c(
+  "IFIT1", "IFIT2", "IFIT3",
+  "ISG15", "ISG20",
+  "MX1", "MX2",
+  "OAS1", "OAS2", "OAS3", "OASL",
+  "IRF7", "IRF9",
+  "STAT1", "STAT2",
+  "IFIH1", "IFI27", "IFI35", "IFI44", "IFI44L", "IFI6",
+  "RSAD2", "BST2",
+  "CXCL10", "CXCL11",
+  "DDX58", "DHX58",
+  "HERC5", "PLSCR1", "USP18",
+  "GBP1", "GBP2", "GBP4", "GBP5",
+  "SECTM1"
+)
+
+# Terminal T cell exhaustion markers
+# Note: NR4A1-3 are written as explicit symbols (avoiding en-dash encoding issues)
+# ENTPD1 = CD39
+term_ex <- c("TOX", "EOMES", "PRDM1", "BATF",
+             "NR4A1", "NR4A2", "NR4A3",
+             "PDCD1", "HAVCR2", "TIGIT", "CTLA4", "LAG3", "ENTPD1")
+
+# Progenitor / stem-like exhausted T cell markers
+prog_ex <- c("TCF7", "CCR7", "CXCR5", "IL7R")
+```
+
+```{r ssgsea-helper}
+# Helper function: runs ssGSEA for a single gene set against the expression matrix
+# expr_mat  — genes x samples matrix (TPM)
+# genes     — character vector of gene symbols for the gene set
+# set_name  — label used in warning messages
+run_ssgsea_one <- function(expr_mat, genes, set_name) {
+  genes_use <- intersect(genes, rownames(expr_mat))
+
+  if (length(genes_use) == 0) {
+    message("No genes found in expression matrix for set: ", set_name)
+    return(rep(NA_real_, ncol(expr_mat)))
+  }
+  if (length(genes_use) < length(genes)) {
+    message("Set '", set_name, "' is missing: ",
+            paste(setdiff(genes, genes_use), collapse = ", "))
+  }
+
+  # Build ssGSEA parameter object and run — alpha = 0.25 is the standard ssGSEA weighting
+  param <- ssgseaParam(
+    expr_mat,
+    list(tmp = genes_use),
+    assay      = NA_character_,
+    annotation = NULL,
+    minSize    = 1,
+    maxSize    = Inf,
+    alpha      = 0.25,
+    normalize  = TRUE
+  )
+
+  as.numeric(GSVA::gsva(param, BPPARAM = BiocParallel::SerialParam(progressbar = TRUE)))
+}
+```
+
+```{r run-ssgsea}
+# Compute ssGSEA scores for all four gene sets
+cgas_scores   <- run_ssgsea_one(tpm_methrna, cgas,    "cgas_sting")
+isg_scores    <- run_ssgsea_one(tpm_methrna, isg,     "isg")
+termex_scores <- run_ssgsea_one(tpm_methrna, term_ex, "terminal_exhaustion")
+progex_scores <- run_ssgsea_one(tpm_methrna, prog_ex, "progenitor_exhaustion")
+
+# Assemble scores into a data frame aligned to the TPM column order
+scores_df <- data.frame(
+  submitter_id = colnames(tpm_methrna),
+  cgas_sting   = cgas_scores,
+  isg          = isg_scores,
+  term_ex      = termex_scores,
+  prog_ex      = progex_scores,
+  stringsAsFactors = FALSE
+)
+
+# Join ssGSEA scores onto the aligned phenotype table
+pheno_methrna <- left_join(pheno_methrna, scores_df, by = "submitter_id")
+```
+
+---
+
+## Step 5: Violin / Boxplots by RE Subtype
+
+Each plot compares a signature or gene expression value across NEMO subtypes.
+Pairwise BH-adjusted p-values are added with `geom_pwc()`.
+
+To compare a different variable, change the `y` aesthetic and `labs(y = ...)` accordingly.
+Available variables in `pheno_methrna`: `EPAS1`, `HIF1A`, `PDCD1`, `cgas_sting`, `isg`,
+`term_ex`, `prog_ex`, and any HiTIMED cell type column.
+
+```{r plot-helper}
+# Reusable function to generate violin + boxplot for any numeric variable
+# df       — data frame (pheno_methrna)
+# y_var    — column name as a string (e.g. "EPAS1")
+# y_label  — y-axis label for the plot
+plot_by_nemo <- function(df, y_var, y_label) {
+  ggplot(df, aes(x = NEMO, y = as.numeric(.data[[y_var]]), fill = NEMO)) +
+    geom_violin(trim = FALSE, alpha = 0.4, color = NA) +
+    geom_boxplot(width = 0.20, alpha = 0.9, outlier.shape = NA, color = "black") +
+    scale_fill_manual(values = c(
+      "Repressed" = "#117733",
+      "Transient" = "#fdb813",
+      "Active"    = "#ae2029"
+    )) +
+    geom_pwc(
+      method          = "wilcox.test",
+      p.adjust.method = "BH",
+      label           = "p.adj.signif",
+      label.size      = 5
+    ) +
+    labs(y = y_label, x = NULL) +
+    theme_bw(base_size = 20) +
+    theme(
+      legend.position  = "none",
+      axis.title       = element_text(face = "bold", size = 25),
+      axis.text.x      = element_text(face = "bold", size = 20),
+      axis.text.y      = element_text(size = 20),
+      plot.title       = element_text(hjust = 0.5, face = "bold", size = 18),
+      panel.grid       = element_blank()
+    )
+}
+```
+
+```{r plots}
+# Hypoxia transcription factors
+plot_by_nemo(pheno_methrna, "EPAS1",  "EPAS1 / HIF-2α (TPM)")
+plot_by_nemo(pheno_methrna, "HIF1A",  "HIF1A / HIF-1α (TPM)")
+
+# Immune checkpoint
+plot_by_nemo(pheno_methrna, "PDCD1",  "PDCD1 / PD-1 (TPM)")
+
+# Immune response pathway scores
+plot_by_nemo(pheno_methrna, "cgas_sting", "cGAS-STING Score (ssGSEA)")
+plot_by_nemo(pheno_methrna, "isg",        "ISG Score (ssGSEA)")
+plot_by_nemo(pheno_methrna, "term_ex",    "Terminal Exhaustion Score (ssGSEA)")
+plot_by_nemo(pheno_methrna, "prog_ex",    "Progenitor Exhaustion Score (ssGSEA)")
+
+# Uncomment to save individual plots, e.g.:
+# ggsave("results/figures/EPAS1_by_NEMO.pdf", width = 6, height = 6)
+```
